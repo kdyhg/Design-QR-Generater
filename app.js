@@ -1,8 +1,8 @@
 "use strict";
 
-const QR_CONFIG = Object.freeze({ correction: "H", quietModules: 4, contrastWarning: 4.5, maxBatch: 30 });
+const QR_CONFIG = Object.freeze({ correction: "H", contrastWarning: 4.5, maxBatch: 30 });
 const DEFAULTS = Object.freeze({
-  shapeSelect: "heart", dotStyle: "square", edgeStyle: "adaptive", fgColor: "#000000", bgColor: "#ffffff",
+  shapeSelect: "heart", dotStyle: "square", fgColor: "#000000", bgColor: "#ffffff",
   gradientMode: "solid", gradientColor: "#d9365e", pngSize: "1024", paletteSelect: "custom"
 });
 const PALETTES = {
@@ -144,13 +144,12 @@ function getOrnamentModules(shape, count) {
 function buildLayout(qr, shape) {
   const count = qr.getModuleCount(), cellSize = getCellSize(count);
   const qrSize = count * cellSize;
-  const outer = (getOrnamentModules(shape, count) + QR_CONFIG.quietModules) * cellSize;
+  const outer = getOrnamentModules(shape, count) * cellSize;
   return { count, cellSize, qrSize, outer, canvasSize: qrSize + 2 * outer, qrX: outer, qrY: outer };
 }
 function currentOptions() {
   return {
     shape: $("shapeSelect").value, dotStyle: $("dotStyle").value,
-    edgeStyle: $("edgeStyle").value,
     fg: $("fgColor").value, bg: $("bgColor").value,
     gradient: $("gradientMode").value === "gradient",
     gradientColor: $("gradientColor").value,
@@ -167,9 +166,9 @@ function generateQR() {
     const result = renderPayload(payload.value, opts, canvas);
     const report = verifyCanvas(canvas, payload.value, result.warnings);
     lastGenerated = { ...result, value: payload.value, options: opts, verified: report.verified };
-    const edgeNote = result.layout.artGapModules < QR_CONFIG.quietModules && opts.shape !== "square"
-      ? "연결형 장식 · 여백 " + result.layout.artGapModules + "칸 (실사용 카메라 확인 권장)"
-      : "표준 여백 4칸";
+    const edgeNote = opts.shape !== "square"
+      ? "장식과 QR 사이 지정 여백 0칸 · 실제 카메라 스캔도 확인해주세요."
+      : "기본 사각형 QR · 외부 여백 0칸";
     setScanState(report.type, report.title, report.detail + " " + edgeNote);
   } catch (err) {
     lastGenerated = null;
@@ -185,38 +184,33 @@ function renderPayload(value, opts, canvas) {
   const ctx = canvas.getContext("2d", { willReadFrequently: true });
   if (!ctx) throw new Error("Canvas를 지원하지 않는 브라우저입니다.");
 
-  // 가까운 장식부터 시도하되, 실제 디코딩 및 축소 화면 검증에서 실패하면 여백을 늘립니다.
-  // 표준(QR quiet zone)은 4모듈이며, 연결형 모드는 디코딩을 통과한 후보만 선택합니다.
-  const candidates = opts.shape === "square" || opts.edgeStyle === "standard"
-    ? [{ gap: 4, bridges: false }]
-    : [
-      { gap: 1, bridges: true },
-      { gap: 1, bridges: false },
-      { gap: 2, bridges: false },
-      { gap: 3, bridges: false },
-      { gap: 4, bridges: false }
-    ];
-  for (const candidate of candidates) {
-    layout.artGapModules = candidate.gap;
-    layout.bridgeEnabled = candidate.bridges;
+  // 지정 여백은 언제나 0칸입니다. 밀도만 조절하며 QR 주변에 띠를 만들지 않습니다.
+  // 검증에 실패하더라도 1~4칸의 여백으로 되돌아가지 않습니다.
+  const profiles = opts.shape === "square" ? [
+    { contact: 0, near: 0, middle: 0, far: 0, variation: 0 }
+  ] : [
+    { contact: 0.08, near: 0.12, middle: 0.20, far: 0.64, variation: 0 },
+    { contact: 0.05, near: 0.08, middle: 0.20, far: 0.64, variation: 0 },
+    { contact: 0.025, near: 0.06, middle: 0.16, far: 0.64, variation: 0 },
+    { contact: 0.025, near: 0.06, middle: 0.16, far: 0.64, variation: 1 },
+    { contact: 0.012, near: 0.04, middle: 0.12, far: 0.64, variation: 2 }
+  ];
+
+  for (const profile of profiles) {
+    opts.decorationProfile = profile;
     ctx.setTransform(1, 0, 0, 1, 0, 0);
     ctx.imageSmoothingEnabled = false;
     ctx.fillStyle = opts.bg;
     ctx.fillRect(0, 0, canvas.width, canvas.height);
     const ink = canvasInk(ctx, opts, layout);
-    if (opts.shape !== "square") {
-      ctx.fillStyle = ink;
-      eachDecoration(layout, opts, value, (x, y, size) => ctx.fillRect(x, y, size, size));
-      eachConnector(qr, layout, opts, value, (x, y, size) => ctx.fillRect(x, y, size, size));
-    }
-    // 외곽에 하얀 사각형을 덧칠하지 않습니다.
-    // 장식 생성 시 선택된 여백만 비워서 직사각형 테두리가 드러나는 현상을 줄입니다.
     ctx.fillStyle = ink;
+    if (opts.shape !== "square") {
+      eachDecoration(layout, opts, value, (x, y, size) => ctx.fillRect(x, y, size, size), qr);
+    }
     eachModule(qr, layout, opts.dotStyle, (shape, x, y, size) => drawModule(ctx, shape, x, y, size));
     if (opts.logo) drawLogo(ctx, layout, opts);
 
-    if (candidate.gap === QR_CONFIG.quietModules ||
-        (decodeMatches(canvas, value) && decodeMatchesAtPreviewSize(canvas, value))) break;
+    if (decodeMatches(canvas, value) && decodeMatchesAtPreviewSize(canvas, value)) break;
   }
   return { qr, layout, warnings: getQualityWarnings(opts) };
 }
@@ -301,50 +295,42 @@ function eachModule(qr, layout, style, callback) {
     }
   }
 }
-function eachDecoration(layout, opts, value, callback) {
+function eachDecoration(layout, opts, value, callback, qr = null) {
   const step = layout.cellSize, size = layout.canvasSize;
-  const quiet = (layout.artGapModules ?? QR_CONFIG.quietModules) * step;
-  const forbidden = {
-    left: layout.qrX - quiet, top: layout.qrY - quiet,
-    right: layout.qrX + layout.qrSize + quiet,
-    bottom: layout.qrY + layout.qrSize + quiet
+  const { qrX, qrY, qrSize, count } = layout;
+  const right = qrX + qrSize, bottom = qrY + qrSize;
+  const profile = opts.decorationProfile || {
+    contact: 0.05, near: 0.08, middle: 0.20, far: 0.64, variation: 0
   };
-  const chanceBase = Math.min(0.78, Math.max(0.58, 0.54 + layout.count * 0.003));
-  const seed = value + "|" + opts.shape + "|" + opts.seedOffset;
+  const seed = value + "|" + opts.shape + "|" + opts.seedOffset + "|" + profile.variation;
+
   for (let y = 0; y < size; y += step) for (let x = 0; x < size; x += step) {
     const cx = x + step / 2, cy = y + step / 2;
-    if (inRect(cx, cy, forbidden) || !insideShape(opts.shape, cx, cy, size)) continue;
-    const edge = !insideShape(opts.shape, cx - 2 * step, cy, size) ||
-      !insideShape(opts.shape, cx + 2 * step, cy, size) ||
-      !insideShape(opts.shape, cx, cy - 2 * step, size) ||
-      !insideShape(opts.shape, cx, cy + 2 * step, size);
-    if (seededUnit(seed + "|" + x + "|" + y) <= (edge ? 0.94 : chanceBase)) callback(x, y, step);
-  }
-}
-// 소수의 연결점만 QR 가장자리 중앙 부근에 배치합니다.
-// 파인더 패턴이 있는 모서리는 피하고, 자동 스캔이 실패하면 렌더러가 연결점을 제외합니다.
-function eachConnector(qr, layout, opts, value, callback) {
-  if (opts.shape === "square" || !layout.bridgeEnabled || layout.artGapModules !== 1) return;
-  const first = Math.max(9, Math.floor(layout.count * 0.24));
-  const last = Math.min(layout.count - 10, Math.ceil(layout.count * 0.76));
-  const step = layout.cellSize;
-  for (let i = first; i < last; i++) {
-    const sides = [
-      { row: 0, col: i, x: layout.qrX + i * step, y: layout.qrY - step },
-      { row: layout.count - 1, col: i, x: layout.qrX + i * step, y: layout.qrY + layout.qrSize },
-      { row: i, col: 0, x: layout.qrX - step, y: layout.qrY + i * step },
-      { row: i, col: layout.count - 1, x: layout.qrX + layout.qrSize, y: layout.qrY + i * step }
-    ];
-    for (let side = 0; side < sides.length; side++) {
-      const item = sides[side];
-      if (!qr.isDark(item.row, item.col)) continue;
-      if (!insideShape(opts.shape, item.x + step / 2, item.y + step / 2, layout.canvasSize)) continue;
-      if (seededUnit(value + "|" + opts.shape + "|" + opts.seedOffset + "|bridge|" + side + "|" + i) > 0.34) continue;
-      callback(item.x, item.y, step);
+    // ONLY the QR itself is excluded; no reserved blank modules outside its border.
+    if (cx >= qrX && cx < right && cy >= qrY && cy < bottom) continue;
+    if (!insideShape(opts.shape, cx, cy, size)) continue;
+    const distance = Math.max(qrX - cx, cx - right, qrY - cy, cy - bottom, 0) / step;
+    const touching = distance < 0.51;
+    let chance;
+    if (touching) {
+      // Connect sparse ornaments to dark modules in the actual QR boundary.
+      // A white boundary cell is not artificially converted to a dark QR module.
+      let adjacentDark = false;
+      if (qr && x < qrX && y >= qrY && y < bottom) adjacentDark = qr.isDark(Math.floor((y - qrY) / step), 0);
+      else if (qr && x >= right && y >= qrY && y < bottom) adjacentDark = qr.isDark(Math.floor((y - qrY) / step), count - 1);
+      else if (qr && y < qrY && x >= qrX && x < right) adjacentDark = qr.isDark(0, Math.floor((x - qrX) / step));
+      else if (qr && y >= bottom && x >= qrX && x < right) adjacentDark = qr.isDark(count - 1, Math.floor((x - qrX) / step));
+      chance = adjacentDark ? profile.contact : 0;
+    } else if (distance < 2) {
+      chance = profile.near;
+    } else if (distance < 3) {
+      chance = profile.middle;
+    } else {
+      chance = profile.far;
     }
+    if (seededUnit("v4|" + seed + "|" + x + "|" + y) < chance) callback(x, y, step);
   }
 }
-
 function inRect(x, y, rect) {
   return x >= rect.left && x < rect.right && y >= rect.top && y < rect.bottom;
 }
@@ -528,8 +514,7 @@ function createSVG(result) {
     const addDecoration = (x, y, size) => {
       body.push('<rect x="' + x + '" y="' + y + '" width="' + size + '" height="' + size + '" fill="' + fill + '"/>');
     };
-    eachDecoration(layout, opts, value, addDecoration);
-    eachConnector(qr, layout, opts, value, addDecoration);
+    eachDecoration(layout, opts, value, addDecoration, qr);
   }
   eachModule(qr, layout, opts.dotStyle, (shape, x, y, size) => {
     if (shape === "circle") {
