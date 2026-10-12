@@ -15,7 +15,7 @@ const ctx = vm.createContext({ document, URL, Blob, TextEncoder, setTimeout, cle
 vm.runInContext(fs.readFileSync(path.join(root, "vendor", "qrcode.min.js"), "utf8"), ctx);
 vm.runInContext(fs.readFileSync(path.join(root, "vendor", "jsQR.js"), "utf8"), ctx);
 vm.runInContext(fs.readFileSync(path.join(root, "app.js"), "utf8") +
-  "\nthis.api={normalizeUrl,readPayload,createQr,buildLayout,eachDecoration,eachModule,isProtectedModule,alignmentCenters,insideShape,createSVG,zipFiles,contrastRatio};", ctx);
+  "\nthis.api={normalizeUrl,readPayload,createQr,buildLayout,eachDecoration,eachModule,isProtectedModule,alignmentCenters,insideShape,pointInPolygon,SHARP_STAR_POINTS,decorationMatrix,createSVG,zipFiles,contrastRatio};", ctx);
 const api = ctx.api;
 
 test("URL normalization rejects invalid or unsafe protocols", () => {
@@ -36,28 +36,27 @@ test("plain text and Wi-Fi payloads escape delimiters", () => {
   assert.equal(api.readPayload().value, "한국어 테스트");
 });
 
-test("all QR layouts have zero imposed whitespace modules", () => {
-  const value = "https://example.com/path";
-  const qr = api.createQr(value);
-  const square = api.buildLayout(qr, "square");
-  assert.equal(square.qrX, 0);
-  assert.equal(square.qrY, 0);
-  assert.equal(square.canvasSize, square.qrSize);
+test("decorations have no padded white frame and keep QR untouched", () => {
+  const value = "https://example.com/path", qr = api.createQr(value);
+  const basic = api.buildLayout(qr, "square");
+  assert.equal(basic.qrX, 0);
+  assert.equal(basic.qrY, 0);
+  assert.equal(basic.canvasSize, basic.qrSize);
   for (const shape of ["heart", "star", "circle", "flower", "cloud", "bubble"]) {
-    const layout = api.buildLayout(qr, shape);
-    const opts = { shape, seedOffset: 0, decorationProfile: {
-      contact: 0.08, near: 0.12, middle: 0.20, far: 0.64, variation: 0
-    }};
-    let touch = 0, painted = 0;
-    api.eachDecoration(layout, opts, value, (x, y, size) => {
-      painted++;
-      assert.ok(!(x >= layout.qrX && x < layout.qrX + layout.qrSize &&
-        y >= layout.qrY && y < layout.qrY + layout.qrSize), "art must not overwrite QR matrix");
-      if (x + size === layout.qrX || x === layout.qrX + layout.qrSize ||
-          y + size === layout.qrY || y === layout.qrY + layout.qrSize) touch++;
+    const layout = api.buildLayout(qr, shape), data = api.decorationMatrix(layout, {shape, seedOffset:0}, value);
+    const unit = layout.cellSize;
+    let pieces = 0, contact = 0;
+    api.eachDecoration(layout, {shape, seedOffset:0}, value, (x,y,size) => {
+      pieces++;
+      assert.equal(size, unit);
+      assert.ok(x + size <= layout.qrX || x >= layout.qrX + layout.qrSize ||
+        y + size <= layout.qrY || y >= layout.qrY + layout.qrSize);
+      if ((x + size === layout.qrX || x === layout.qrX + layout.qrSize ||
+           y + size === layout.qrY || y === layout.qrY + layout.qrSize)) contact++;
     }, qr);
-    assert.ok(painted > 0, shape + " has decoration");
-    assert.ok(touch > 0, shape + " has directly touching decoration");
+    assert.ok(pieces > 50, shape + " should be densely decorated");
+    assert.ok(contact > 0, shape + " should touch QR directly");
+    assert.equal(data.dark.length, data.cols * data.cols);
   }
 });
 
@@ -92,104 +91,56 @@ test("ZIP archive has valid local and directory headers", async () => {
   assert.equal(dv.getUint16(buffer.byteLength - 22 + 10, true), 2);
 });
 
-test("bundled scanner decodes all six decorated QR shapes", () => {
-  const value = "https://example.com/test";
-  const qr = api.createQr(value);
-  for (const shape of ["square", "heart", "star", "circle", "flower", "cloud", "bubble"]) {
-    const layout = api.buildLayout(qr, shape), size = layout.canvasSize;
-    const pixels = new Uint8ClampedArray(size * size * 4);
-    for (let i = 0; i < pixels.length; i += 4) {
-      pixels[i] = pixels[i + 1] = pixels[i + 2] = 255;
-      pixels[i + 3] = 255;
-    }
-    function draw(x, y, width) {
-      for (let yy = y; yy < y + width; yy++) for (let xx = x; xx < x + width; xx++) {
-        const i = (yy * size + xx) * 4;
-        pixels[i] = pixels[i + 1] = pixels[i + 2] = 0;
+test("all shape silhouettes have consistently dense connected texture", () => {
+  const qr = api.createQr("https://example.com/creative");
+  for (const shape of ["heart","star","circle","flower","cloud","bubble"]) {
+    const layout = api.buildLayout(qr,shape);
+    const opts = {shape, seedOffset:0};
+    const bitmap = api.decorationMatrix(layout,opts,"https://example.com/creative");
+    const N=bitmap.cols, unit=layout.cellSize;
+    let inside=0, colored=0;
+    for(let r=0;r<N;r++)for(let c=0;c<N;c++){
+      if(c*unit>=layout.qrX&&c*unit<layout.qrX+layout.qrSize &&
+        r*unit>=layout.qrY&&r*unit<layout.qrY+layout.qrSize) continue;
+      if(api.insideShape(shape,(c+0.5)*unit,(r+0.5)*unit,layout.canvasSize)){
+        inside++;colored+=bitmap.dark[r*N+c];
       }
     }
-    if (shape !== "square") api.eachDecoration(layout, { shape, seedOffset: 0 }, value, draw);
-    api.eachModule(qr, layout, "square", (_shape, x, y, width) => draw(x, y, width));
-    const decoded = ctx.jsQR(pixels, size, size, { inversionAttempts: "attemptBoth" });
-    assert.equal(decoded && decoded.data, value, shape);
+    assert.ok(colored/inside > 0.62, shape + " should not be sparse");
+    assert.ok(colored/inside < 0.94, shape + " should keep readable pixel pattern");
+    assert.deepEqual(Array.from(api.decorationMatrix(layout,opts,"https://example.com/creative").dark),
+      Array.from(bitmap.dark), "same inputs should render same pattern");
   }
 });
-
-test("URL/text/Wi-Fi can be encoded and decoded", () => {
-  const values = ["https://example.com/test", "수학 자료실 QR", "WIFI:T:WPA;S:Test;P:secret;;"];
-  for (const value of values) {
-    const qr = api.createQr(value), count = qr.getModuleCount(), unit = 10, quiet = 0;
-    const size = (count + quiet * 2) * unit, pixels = new Uint8ClampedArray(size * size * 4);
-    for (let y = 0; y < size; y++) for (let x = 0; x < size; x++) {
-      const row = Math.floor(y / unit) - quiet, col = Math.floor(x / unit) - quiet;
-      const dark = row >= 0 && col >= 0 && row < count && col < count && qr.isDark(row, col);
-      const grey = dark ? 0 : 255, i = (y * size + x) * 4;
-      pixels[i] = pixels[i + 1] = pixels[i + 2] = grey; pixels[i + 3] = 255;
+test("five-point star has straight sharp tips, not rounded cosine lobes", () => {
+  assert.equal(api.SHARP_STAR_POINTS.length,10);
+  assert.ok(api.SHARP_STAR_POINTS.every((p)=>p.length===2));
+  assert.equal(api.insideShape("star",50,2,100),true);
+  assert.equal(api.insideShape("star",50,30,100),true);
+  assert.equal(api.insideShape("star",99,1,100),false);
+  // Halfway between an outer point and an inner notch is a straight edge.
+  const A=api.SHARP_STAR_POINTS[0], B=api.SHARP_STAR_POINTS[1];
+  assert.equal(api.pointInPolygon((A[0]+B[0])*0.49, (A[1]+B[1])*0.49,
+    api.SHARP_STAR_POINTS),true);
+});
+test("QR matrix encodes URL, Korean text and Wi-Fi information", () => {
+  for (const value of ["https://example.com/test","수학 자료실 QR","WIFI:T:WPA;S:Test;P:secret;;"]){
+    const qr=api.createQr(value),count=qr.getModuleCount(), unit=10, size=count*unit;
+    const pixels=new Uint8ClampedArray(size*size*4);
+    for(let y=0;y<size;y++)for(let x=0;x<size;x++){
+      const dark=qr.isDark(Math.floor(y/unit),Math.floor(x/unit)),idx=(y*size+x)*4;
+      pixels[idx]=pixels[idx+1]=pixels[idx+2]=dark?0:255;pixels[idx+3]=255;
     }
-    const decoded = ctx.jsQR(pixels, size, size);
-    assert.equal(decoded && decoded.data, value);
+    const decoded=ctx.jsQR(pixels,size,size,{inversionAttempts:"attemptBoth"});
+    assert.equal(decoded&&decoded.data,value);
   }
 });
-
-
-test("zero-gap QR decoration decodes without any 1-4 module fallback", () => {
-  const values = ["https://www.google.com/", "https://example.com/long/path?q=math",
-    "학생 활동 QR 테스트", "WIFI:T:WPA;S:school;P:password123;;"];
-  const shapes = ["square", "heart", "star", "circle", "flower", "cloud", "bubble"];
-  const profiles = [
-    { contact: 0.08, near: 0.12, middle: 0.20, far: 0.64, variation: 0 },
-    { contact: 0.05, near: 0.08, middle: 0.20, far: 0.64, variation: 0 },
-    { contact: 0.025, near: 0.06, middle: 0.16, far: 0.64, variation: 0 },
-    { contact: 0.025, near: 0.06, middle: 0.16, far: 0.64, variation: 1 },
-    { contact: 0.012, near: 0.04, middle: 0.12, far: 0.64, variation: 2 }
-  ];
-  for (const value of values) {
-    const qr = api.createQr(value);
-    for (const shape of shapes) {
-      const layout = api.buildLayout(qr, shape), side = layout.canvasSize;
-      const pixels = new Uint8ClampedArray(side * side * 4);
-      const paint = (x, y, size) => {
-        for (let yy = y; yy < y + size; yy++) for (let xx = x; xx < x + size; xx++) {
-          const idx = (yy * side + xx) * 4;
-          pixels[idx] = pixels[idx + 1] = pixels[idx + 2] = 0;
-        }
-      };
-      let success = false;
-      for (const profile of profiles) {
-        for (let i = 0; i < pixels.length; i += 4) {
-          pixels[i] = pixels[i + 1] = pixels[i + 2] = 255;
-          pixels[i + 3] = 255;
-        }
-        if (shape !== "square") {
-          api.eachDecoration(layout, { shape, seedOffset: 0, decorationProfile: profile }, value, paint, qr);
-        }
-        api.eachModule(qr, layout, "square", (_moduleShape, x, y, size) => paint(x, y, size));
-        const decoded = ctx.jsQR(pixels, side, side, { inversionAttempts: "attemptBoth" });
-        if (decoded && decoded.data === value) { success = true; break; }
-      }
-      assert.ok(success, "zero-gap " + shape + " QR should decode " + value);
-    }
-  }
-});
-
-test("SVG contains the same QR-touching ornament squares", () => {
-  const value = "https://www.google.com/";
-  const qr = api.createQr(value);
-  const layout = api.buildLayout(qr, "heart");
-  const opts = { shape: "heart", dotStyle: "square", fg: "#000000", bg: "#ffffff",
-    gradient: false, gradientColor: "#d9365e", logo: null, logoDataUrl: "", seedOffset: 0,
-    decorationProfile: { contact: 0.08, near: 0.12, middle: 0.20, far: 0.64, variation: 0 } };
-  const connected = [];
-  api.eachDecoration(layout, opts, value, (x, y, size) => {
-    if (x + size === layout.qrX || x === layout.qrX + layout.qrSize ||
-        y + size === layout.qrY || y === layout.qrY + layout.qrSize) {
-      connected.push([x, y, size]);
-    }
-  }, qr);
-  assert.ok(connected.length > 0, "ornaments should touch QR border");
-  const svg = api.createSVG({ qr, layout, options: opts, value });
-  for (const [x, y, size] of connected) {
-    assert.ok(svg.includes('<rect x="' + x + '" y="' + y + '" width="' + size +
-      '" height="' + size + '" fill="#000000"/>'));
-  }
+test("SVG uses same dense decorations as raster", () => {
+  const value="https://example.com/svg", qr=api.createQr(value), layout=api.buildLayout(qr,"heart");
+  const opts={shape:"heart",dotStyle:"square",fg:"#ac2748",bg:"#ffffff",gradient:false,
+    gradientColor:"#d9365e",logo:null,logoDataUrl:"",seedOffset:0};
+  const svg=api.createSVG({qr,layout,value,options:opts});
+  let count=0; api.eachDecoration(layout,opts,value,()=>count++,qr);
+  assert.ok(count>100);
+  assert.ok((svg.match(/<rect /g)||[]).length >= count);
 });

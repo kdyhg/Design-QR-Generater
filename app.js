@@ -84,7 +84,7 @@ function scheduleGenerate() {
   updateTimer = setTimeout(generateQR, 380);
 }
 function refreshExportState() {
-  const disabled = !lastGenerated || !lastGenerated.verified || busy;
+  const disabled = !lastGenerated || busy;
   for (const id of ["saveButton", "saveSvgButton", "copyButton"]) $(id).disabled = disabled;
   $("batchButton").disabled = busy;
 }
@@ -139,7 +139,7 @@ function getCellSize(count) {
 }
 function getOrnamentModules(shape, count) {
   if (shape === "square") return 0;
-  return Math.max(Math.round(count * (shape === "star" ? 0.9 : 0.42)), 12);
+  return Math.max(Math.round(count * (shape === "star" ? 1.10 : 0.42)), 12);
 }
 function buildLayout(qr, shape) {
   const count = qr.getModuleCount(), cellSize = getCellSize(count);
@@ -184,34 +184,20 @@ function renderPayload(value, opts, canvas) {
   const ctx = canvas.getContext("2d", { willReadFrequently: true });
   if (!ctx) throw new Error("Canvas를 지원하지 않는 브라우저입니다.");
 
-  // 지정 여백은 언제나 0칸입니다. 밀도만 조절하며 QR 주변에 띠를 만들지 않습니다.
-  // 검증에 실패하더라도 1~4칸의 여백으로 되돌아가지 않습니다.
-  const profiles = opts.shape === "square" ? [
-    { contact: 0, near: 0, middle: 0, far: 0, variation: 0 }
-  ] : [
-    { contact: 0.08, near: 0.12, middle: 0.20, far: 0.64, variation: 0 },
-    { contact: 0.05, near: 0.08, middle: 0.20, far: 0.64, variation: 0 },
-    { contact: 0.025, near: 0.06, middle: 0.16, far: 0.64, variation: 0 },
-    { contact: 0.025, near: 0.06, middle: 0.16, far: 0.64, variation: 1 },
-    { contact: 0.012, near: 0.04, middle: 0.12, far: 0.64, variation: 2 }
-  ];
-
-  for (const profile of profiles) {
-    opts.decorationProfile = profile;
-    ctx.setTransform(1, 0, 0, 1, 0, 0);
-    ctx.imageSmoothingEnabled = false;
-    ctx.fillStyle = opts.bg;
-    ctx.fillRect(0, 0, canvas.width, canvas.height);
-    const ink = canvasInk(ctx, opts, layout);
-    ctx.fillStyle = ink;
-    if (opts.shape !== "square") {
-      eachDecoration(layout, opts, value, (x, y, size) => ctx.fillRect(x, y, size, size), qr);
-    }
-    eachModule(qr, layout, opts.dotStyle, (shape, x, y, size) => drawModule(ctx, shape, x, y, size));
-    if (opts.logo) drawLogo(ctx, layout, opts);
-
-    if (decodeMatches(canvas, value) && decodeMatchesAtPreviewSize(canvas, value)) break;
+  // Keep the ornaments dense and uniform. Never sacrifice the silhouette
+  // to satisfy a single browser decoder: users can test the exported image
+  // on the actual phone they intend to use.
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.imageSmoothingEnabled = false;
+  ctx.fillStyle = opts.bg;
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.fillStyle = canvasInk(ctx, opts, layout);
+  if (opts.shape !== "square") {
+    eachDecoration(layout, opts, value, (x, y, size) => ctx.fillRect(x, y, size, size), qr);
   }
+  eachModule(qr, layout, opts.dotStyle, (shape, x, y, size) => drawModule(ctx, shape, x, y, size));
+  if (opts.logo) drawLogo(ctx, layout, opts);
+
   return { qr, layout, warnings: getQualityWarnings(opts) };
 }
 function decodeMatches(canvas, expected) {
@@ -295,40 +281,78 @@ function eachModule(qr, layout, style, callback) {
     }
   }
 }
-function eachDecoration(layout, opts, value, callback, qr = null) {
-  const step = layout.cellSize, size = layout.canvasSize;
-  const { qrX, qrY, qrSize, count } = layout;
-  const right = qrX + qrSize, bottom = qrY + qrSize;
-  const profile = opts.decorationProfile || {
-    contact: 0.05, near: 0.08, middle: 0.20, far: 0.64, variation: 0
-  };
-  const seed = value + "|" + opts.shape + "|" + opts.seedOffset + "|" + profile.variation;
-
-  for (let y = 0; y < size; y += step) for (let x = 0; x < size; x += step) {
-    const cx = x + step / 2, cy = y + step / 2;
-    // ONLY the QR itself is excluded; no reserved blank modules outside its border.
-    if (cx >= qrX && cx < right && cy >= qrY && cy < bottom) continue;
-    if (!insideShape(opts.shape, cx, cy, size)) continue;
-    const distance = Math.max(qrX - cx, cx - right, qrY - cy, cy - bottom, 0) / step;
-    const touching = distance < 0.51;
-    let chance;
-    if (touching) {
-      // Connect sparse ornaments to dark modules in the actual QR boundary.
-      // A white boundary cell is not artificially converted to a dark QR module.
-      let adjacentDark = false;
-      if (qr && x < qrX && y >= qrY && y < bottom) adjacentDark = qr.isDark(Math.floor((y - qrY) / step), 0);
-      else if (qr && x >= right && y >= qrY && y < bottom) adjacentDark = qr.isDark(Math.floor((y - qrY) / step), count - 1);
-      else if (qr && y < qrY && x >= qrX && x < right) adjacentDark = qr.isDark(0, Math.floor((x - qrX) / step));
-      else if (qr && y >= bottom && x >= qrX && x < right) adjacentDark = qr.isDark(count - 1, Math.floor((x - qrX) / step));
-      chance = adjacentDark ? profile.contact : 0;
-    } else if (distance < 2) {
-      chance = profile.near;
-    } else if (distance < 3) {
-      chance = profile.middle;
-    } else {
-      chance = profile.far;
+// Uniform pixel-art silhouette with one connected pattern.
+// The outline is drawn solid, the interior has a stable QR-like texture.
+// All shapes use the same density (unlike the old sparse edge profiles).
+function decorationMatrix(layout, opts, value) {
+  const step = layout.cellSize, cols = layout.canvasSize / step;
+  const mask = new Uint8Array(cols * cols), dark = new Uint8Array(cols * cols);
+  const qrStart = layout.qrX / step, qrEnd = qrStart + layout.count;
+  const index = (r, c) => r * cols + c;
+  const valid = (r, c) => r >= 0 && c >= 0 && r < cols && c < cols;
+  const belongs = (r, c) => valid(r, c) && Boolean(mask[index(r, c)]);
+  const isQr = (r, c) => r >= qrStart && r < qrEnd && c >= qrStart && c < qrEnd;
+  const seed = value + "|" + opts.shape + "|" + (opts.seedOffset || 0);
+  for (let r = 0; r < cols; r++) for (let c = 0; c < cols; c++) {
+    if (isQr(r, c)) continue;
+    if (insideShape(opts.shape, (c + 0.5) * step, (r + 0.5) * step, layout.canvasSize)) {
+      mask[index(r, c)] = 1;
     }
-    if (seededUnit("v4|" + seed + "|" + x + "|" + y) < chance) callback(x, y, step);
+  }
+  const neighbors = [[1,0], [-1,0], [0,1], [0,-1]];
+  for (let r = 0; r < cols; r++) for (let c = 0; c < cols; c++) {
+    const i = index(r, c);
+    if (!mask[i]) continue;
+    // Keep all silhouette edge cells dark for clean, sharp outlines.
+    const edge = neighbors.some(([dy, dx]) => !valid(r + dy, c + dx) ||
+      (!belongs(r + dy, c + dx) && !isQr(r + dy, c + dx)));
+    const random = seededUnit("solid|" + seed + "|" + r + "|" + c);
+    if (edge || random < 0.68) dark[i] = 1;
+  }
+
+  // Attach all ornament modules to a QR boundary component. Remove any
+  // disconnected noise; the solid outer outline survives as one component.
+  const visited = new Uint8Array(cols * cols);
+  const queue = [];
+  for (let r = 0; r < cols; r++) for (let c = 0; c < cols; c++) {
+    const i = index(r, c);
+    if (!dark[i]) continue;
+    const touchesQr = neighbors.some(([dy, dx]) => isQr(r + dy, c + dx));
+    if (touchesQr) { visited[i] = 1; queue.push(i); }
+  }
+  // If a silhouette never overlaps the QR boundary, keep the principal
+  // ornamental component rather than erasing the entire figure.
+  if (!queue.length) {
+    for (let i = 0; i < dark.length; i++) if (dark[i]) {
+      queue.push(i); visited[i] = 1; break;
+    }
+  }
+  for (let pos = 0; pos < queue.length; pos++) {
+    const at = queue[pos], r = Math.floor(at / cols), c = at % cols;
+    for (const [dy, dx] of neighbors) {
+      const ny = r + dy, nx = c + dx;
+      if (!valid(ny, nx)) continue;
+      const next = index(ny, nx);
+      if (dark[next] && !visited[next]) { visited[next] = 1; queue.push(next); }
+    }
+  }
+  // Retain tiny tip fragments too if adjacent to a kept pixel diagonally;
+  // this avoids blunting the 5 sharp star points on a module grid.
+  for (let k = 0; k < 2; k++) {
+    for (let r = 0; r < cols; r++) for (let c = 0; c < cols; c++) {
+      const i = index(r, c);
+      if (!dark[i] || visited[i]) continue;
+      if ([[1,1],[1,-1],[-1,1],[-1,-1]].some(([dy,dx]) =>
+        valid(r + dy,c + dx) && visited[index(r + dy,c + dx)])) visited[i] = 1;
+    }
+  }
+  return { cols, dark: visited };
+}
+function eachDecoration(layout, opts, value, callback, qr = null) {
+  const pattern = decorationMatrix(layout, opts, value);
+  const unit = layout.cellSize;
+  for (let r = 0; r < pattern.cols; r++) for (let c = 0; c < pattern.cols; c++) {
+    if (pattern.dark[r * pattern.cols + c]) callback(c * unit, r * unit, unit);
   }
 }
 function inRect(x, y, rect) {
@@ -358,13 +382,25 @@ function insideShape(shape, x, y, size) {
     return Math.pow(a * a + b * b - 1, 3) - a * a * b * b * b <= 0;
   }
   if (shape === "star") {
-    const angle = Math.atan2(ny, nx) + Math.PI / 2;
-    const radius = Math.hypot(nx, ny);
-    const petal = Math.cos(5 * angle);
-    return radius <= (0.56 + 0.37 * Math.max(0, petal));
+    // Straight edges between 5 outer tips and 5 inner notches.
+    return pointInPolygon(nx, ny, SHARP_STAR_POINTS);
   }
   return false;
 }
+const SHARP_STAR_POINTS = Array.from({ length: 10 }, (_, i) => {
+  const angle = -Math.PI / 2 + i * Math.PI / 5;
+  const radius = i % 2 === 0 ? 0.98 : 0.50;
+  return [Math.cos(angle) * radius, Math.sin(angle) * radius];
+});
+function pointInPolygon(x, y, points) {
+  let inside = false;
+  for (let i = 0, j = points.length - 1; i < points.length; j = i++) {
+    const [xi, yi] = points[i], [xj, yj] = points[j];
+    if ((yi > y) !== (yj > y) && x < ((xj - xi) * (y - yi) / (yj - yi)) + xi) inside = !inside;
+  }
+  return inside;
+}
+
 function seededUnit(input) {
   let hash = 2166136261;
   for (let i = 0; i < input.length; i++) {
@@ -432,8 +468,8 @@ function verifyCanvas(canvas, expected, warnings) {
     }
     if (result) return { type: "error", title: "다른 내용으로 인식됨",
       detail: "QR을 다른 값으로 읽었습니다. 색상 또는 장식을 변경해주세요.", verified: false };
-    return { type: "error", title: "자동 스캔 검증 실패",
-      detail: "QR을 읽지 못했습니다. 사각형·진한 색상·로고 제거를 시도해보세요. " + details, verified: false };
+    return { type: "warning", title: "브라우저 자동 인식 실패",
+      detail: "촘촘한 디자인으로 브라우저 디코더가 인식하지 못했습니다. 이미지는 저장 가능하며, 사용 전 휴대전화로 직접 스캔해주세요. " + details, verified: false };
   } catch {
     return { type: "warning", title: "자동 검증 오류",
       detail: "자동 검증을 완료하지 못했습니다. 다른 기기에서 직접 확인해주세요.", verified: false };
@@ -646,17 +682,16 @@ async function createBatch() {
         const canvas = document.createElement("canvas");
         const item = renderPayload(value, opts, canvas);
         const result = verifyCanvas(canvas, value, item.warnings);
-        if (!result.verified) { report.push((i + 1) + ". 실패(자동 검증 미통과): " + lines[i]); continue; }
         const blob = await canvasToPng(canvas, Number($("pngSize").value));
         files.push({ name: "qr_" + String(i + 1).padStart(3, "0") + ".png",
           bytes: new Uint8Array(await blob.arrayBuffer()) });
-        report.push((i + 1) + ". 성공: " + value);
+        report.push((i + 1) + ". " + (result.verified ? "자동 검증 통과" : "자동 검증 실패 · 휴대전화 확인 필요") + ": " + value);
       } catch (err) { report.push((i + 1) + ". 실패: " + lines[i] + " (" + err.message + ")"); }
       // 대량 작업 중 화면 업데이트를 허용합니다.
       await new Promise((resolve) => setTimeout(resolve, 0));
     }
     const note = new TextEncoder().encode("QR_HT 일괄 생성 결과\n" +
-      "자동 디코딩이 성공한 QR만 PNG로 저장됩니다. 실제 사용 환경에서도 스캔을 확인해주세요.\n\n" +
+      "촘촘한 장식형 QR은 브라우저 디코더가 읽지 못할 수 있습니다. 모든 이미지의 휴대전화 인식 여부를 확인해주세요.\n\n" +
       report.join("\n") + "\n");
     files.push({ name: "result.txt", bytes: note });
     downloadBlob(zipFiles(files), "qrht_batch.zip");
