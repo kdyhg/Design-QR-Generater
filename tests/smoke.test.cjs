@@ -15,7 +15,7 @@ const ctx = vm.createContext({ document, URL, Blob, TextEncoder, setTimeout, cle
 vm.runInContext(fs.readFileSync(path.join(root, "vendor", "qrcode.min.js"), "utf8"), ctx);
 vm.runInContext(fs.readFileSync(path.join(root, "vendor", "jsQR.js"), "utf8"), ctx);
 vm.runInContext(fs.readFileSync(path.join(root, "app.js"), "utf8") +
-  "\nthis.api={normalizeUrl,readPayload,createQr,buildLayout,eachDecoration,eachModule,isProtectedModule,alignmentCenters,insideShape,pointInPolygon,SHARP_STAR_POINTS,decorationMatrix,createSVG,zipFiles,contrastRatio};", ctx);
+  "\nthis.api={normalizeUrl,readPayload,createQr,buildLayout,eachDecoration,eachModule,isProtectedModule,alignmentCenters,insideShape,pointInPolygon,SHARP_STAR_POINTS,decorationMatrix,getQrDarkRatio,createSVG,zipFiles,contrastRatio};", ctx);
 const api = ctx.api;
 
 test("URL normalization rejects invalid or unsafe protocols", () => {
@@ -91,27 +91,32 @@ test("ZIP archive has valid local and directory headers", async () => {
   assert.equal(dv.getUint16(buffer.byteLength - 22 + 10, true), 2);
 });
 
-test("all shape silhouettes have consistently dense connected texture", () => {
-  const qr = api.createQr("https://example.com/creative");
-  for (const shape of ["heart","star","circle","flower","cloud","bubble"]) {
-    const layout = api.buildLayout(qr,shape);
-    const opts = {shape, seedOffset:0};
-    const bitmap = api.decorationMatrix(layout,opts,"https://example.com/creative");
-    const N=bitmap.cols, unit=layout.cellSize;
-    let inside=0, colored=0;
-    for(let r=0;r<N;r++)for(let c=0;c<N;c++){
-      if(c*unit>=layout.qrX&&c*unit<layout.qrX+layout.qrSize &&
-        r*unit>=layout.qrY&&r*unit<layout.qrY+layout.qrSize) continue;
-      if(api.insideShape(shape,(c+0.5)*unit,(r+0.5)*unit,layout.canvasSize)){
-        inside++;colored+=bitmap.dark[r*N+c];
-      }
+test("outer ornament dark density tracks actual QR dark density across all shapes", () => {
+  const values = ["https://example.com", "https://www.google.com/", "QR 한글 테스트",
+    "WIFI:T:WPA;S:Test;P:password123;;"];
+  for (const value of values) {
+    const qr = api.createQr(value);
+    const target = api.getQrDarkRatio(qr);
+    assert.ok(target > 0.35 && target < 0.7, "expected typical QR module density");
+    for (const shape of ["heart", "star", "circle", "flower", "cloud", "bubble"]) {
+      const layout = api.buildLayout(qr, shape), opts = { shape, seedOffset: 0 };
+      const bitmap = api.decorationMatrix(layout, opts, value, qr);
+      assert.ok(Math.abs(bitmap.targetRatio - target) < 1e-10);
+      assert.ok(Math.abs(bitmap.actualRatio - target) < 0.04,
+        shape + " decoration should match QR dark ratio (not fixed 68%)");
+      assert.deepEqual(Array.from(bitmap.dark),
+        Array.from(api.decorationMatrix(layout, opts, value, qr).dark),
+        "same input should yield deterministic matching texture");
+      let contacts = 0;
+      api.eachDecoration(layout, opts, value, (x, y, cell) => {
+        if (x + cell === layout.qrX || x === layout.qrX + layout.qrSize ||
+            y + cell === layout.qrY || y === layout.qrY + layout.qrSize) contacts++;
+      }, qr);
+      assert.ok(contacts > 0, shape + " should connect without white frame");
     }
-    assert.ok(colored/inside > 0.62, shape + " should not be sparse");
-    assert.ok(colored/inside < 0.94, shape + " should keep readable pixel pattern");
-    assert.deepEqual(Array.from(api.decorationMatrix(layout,opts,"https://example.com/creative").dark),
-      Array.from(bitmap.dark), "same inputs should render same pattern");
   }
 });
+
 test("five-point star has straight sharp tips, not rounded cosine lobes", () => {
   assert.equal(api.SHARP_STAR_POINTS.length,10);
   assert.ok(api.SHARP_STAR_POINTS.every((p)=>p.length===2));

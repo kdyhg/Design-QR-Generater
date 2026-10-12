@@ -284,72 +284,116 @@ function eachModule(qr, layout, style, callback) {
 // Uniform pixel-art silhouette with one connected pattern.
 // The outline is drawn solid, the interior has a stable QR-like texture.
 // All shapes use the same density (unlike the old sparse edge profiles).
-function decorationMatrix(layout, opts, value) {
-  const step = layout.cellSize, cols = layout.canvasSize / step;
-  const mask = new Uint8Array(cols * cols), dark = new Uint8Array(cols * cols);
-  const qrStart = layout.qrX / step, qrEnd = qrStart + layout.count;
-  const index = (r, c) => r * cols + c;
-  const valid = (r, c) => r >= 0 && c >= 0 && r < cols && c < cols;
-  const belongs = (r, c) => valid(r, c) && Boolean(mask[index(r, c)]);
-  const isQr = (r, c) => r >= qrStart && r < qrEnd && c >= qrStart && c < qrEnd;
-  const seed = value + "|" + opts.shape + "|" + (opts.seedOffset || 0);
-  for (let r = 0; r < cols; r++) for (let c = 0; c < cols; c++) {
-    if (isQr(r, c)) continue;
-    if (insideShape(opts.shape, (c + 0.5) * step, (r + 0.5) * step, layout.canvasSize)) {
-      mask[index(r, c)] = 1;
+// Match the visible ornament texture to the density of the QR itself.
+function getQrDarkRatio(qr) {
+  const n = qr.getModuleCount();
+  let dark = 0;
+  for (let row = 0; row < n; row++) {
+    for (let col = 0; col < n; col++) {
+      if (qr.isDark(row, col)) dark++;
     }
   }
-  const neighbors = [[1,0], [-1,0], [0,1], [0,-1]];
-  for (let r = 0; r < cols; r++) for (let c = 0; c < cols; c++) {
-    const i = index(r, c);
+  return dark / (n * n);
+}
+function decorationMatrix(layout, opts, value, qr = null) {
+  const sourceQr = qr || createQr(value);
+  const cols = layout.canvasSize / layout.cellSize;
+  const length = cols * cols;
+  const mask = new Uint8Array(length);
+  const outline = new Uint8Array(length);
+  const scores = new Float32Array(length);
+  const first = layout.qrX / layout.cellSize;
+  const last = first + layout.count;
+  const at = (row, col) => row * cols + col;
+  const inBounds = (row, col) => row >= 0 && col >= 0 && row < cols && col < cols;
+  const inQR = (row, col) => row >= first && row < last && col >= first && col < last;
+  const neighbors = [[-1, 0], [1, 0], [0, -1], [0, 1]];
+  const seed = value + "|" + opts.shape + "|" + (opts.seedOffset || 0);
+  let area = 0;
+  for (let row = 0; row < cols; row++) for (let col = 0; col < cols; col++) {
+    if (inQR(row, col)) continue;
+    if (!insideShape(opts.shape, (col + 0.5) * layout.cellSize,
+      (row + 0.5) * layout.cellSize, layout.canvasSize)) continue;
+    const i = at(row, col);
+    mask[i] = 1;
+    area++;
+    // A modest 2x2 texture component creates QR-like clumps, not isolated specks.
+    const fine = seededUnit("fine|" + seed + "|" + row + "|" + col);
+    const block = seededUnit("tile|" + seed + "|" +
+      Math.floor(row / 2) + "|" + Math.floor(col / 2));
+    scores[i] = 0.78 * fine + 0.22 * block;
+  }
+  for (let row = 0; row < cols; row++) for (let col = 0; col < cols; col++) {
+    const i = at(row, col);
     if (!mask[i]) continue;
-    // Keep all silhouette edge cells dark for clean, sharp outlines.
-    const edge = neighbors.some(([dy, dx]) => !valid(r + dy, c + dx) ||
-      (!belongs(r + dy, c + dx) && !isQr(r + dy, c + dx)));
-    const random = seededUnit("solid|" + seed + "|" + r + "|" + c);
-    if (edge || random < 0.68) dark[i] = 1;
+    // Preserve the recognisable solid silhouette, including sharp star tips.
+    outline[i] = neighbors.some(([dy, dx]) => {
+      const y = row + dy, x = col + dx;
+      return !inBounds(y, x) || (!mask[at(y, x)] && !inQR(y, x));
+    }) ? 1 : 0;
   }
 
-  // Attach all ornament modules to a QR boundary component. Remove any
-  // disconnected noise; the solid outer outline survives as one component.
-  const visited = new Uint8Array(cols * cols);
-  const queue = [];
-  for (let r = 0; r < cols; r++) for (let c = 0; c < cols; c++) {
-    const i = index(r, c);
-    if (!dark[i]) continue;
-    const touchesQr = neighbors.some(([dy, dx]) => isQr(r + dy, c + dx));
-    if (touchesQr) { visited[i] = 1; queue.push(i); }
-  }
-  // If a silhouette never overlaps the QR boundary, keep the principal
-  // ornamental component rather than erasing the entire figure.
-  if (!queue.length) {
-    for (let i = 0; i < dark.length; i++) if (dark[i]) {
-      queue.push(i); visited[i] = 1; break;
+  function connected(threshold) {
+    const candidate = new Uint8Array(length);
+    const kept = new Uint8Array(length);
+    const queue = [];
+    for (let row = 0; row < cols; row++) for (let col = 0; col < cols; col++) {
+      const i = at(row, col);
+      if (!mask[i] || (!outline[i] && scores[i] >= threshold)) continue;
+      candidate[i] = 1;
+      if (neighbors.some(([dy, dx]) => inQR(row + dy, col + dx))) {
+        kept[i] = 1;
+        queue.push(i);
+      }
     }
-  }
-  for (let pos = 0; pos < queue.length; pos++) {
-    const at = queue[pos], r = Math.floor(at / cols), c = at % cols;
-    for (const [dy, dx] of neighbors) {
-      const ny = r + dy, nx = c + dx;
-      if (!valid(ny, nx)) continue;
-      const next = index(ny, nx);
-      if (dark[next] && !visited[next]) { visited[next] = 1; queue.push(next); }
+    if (!queue.length) {
+      const firstDark = candidate.indexOf(1);
+      if (firstDark !== -1) { kept[firstDark] = 1; queue.push(firstDark); }
     }
-  }
-  // Retain tiny tip fragments too if adjacent to a kept pixel diagonally;
-  // this avoids blunting the 5 sharp star points on a module grid.
-  for (let k = 0; k < 2; k++) {
-    for (let r = 0; r < cols; r++) for (let c = 0; c < cols; c++) {
-      const i = index(r, c);
-      if (!dark[i] || visited[i]) continue;
-      if ([[1,1],[1,-1],[-1,1],[-1,-1]].some(([dy,dx]) =>
-        valid(r + dy,c + dx) && visited[index(r + dy,c + dx)])) visited[i] = 1;
+    for (let k = 0; k < queue.length; k++) {
+      const i = queue[k], row = Math.floor(i / cols), col = i % cols;
+      for (const [dy, dx] of neighbors) {
+        const y = row + dy, x = col + dx;
+        if (!inBounds(y, x)) continue;
+        const next = at(y, x);
+        if (candidate[next] && !kept[next]) { kept[next] = 1; queue.push(next); }
+      }
     }
+    // Retain pixels at acute tips if they touch a kept region diagonally.
+    for (let pass = 0; pass < 2; pass++) {
+      for (let row = 0; row < cols; row++) for (let col = 0; col < cols; col++) {
+        const i = at(row, col);
+        if (!candidate[i] || kept[i]) continue;
+        if ([[-1,-1],[-1,1],[1,-1],[1,1]].some(([dy,dx]) =>
+          inBounds(row + dy,col + dx) && kept[at(row + dy,col + dx)])) kept[i] = 1;
+      }
+    }
+    let count = 0;
+    for (const bit of kept) count += bit;
+    return {dark: kept, count};
   }
-  return { cols, dark: visited };
+
+  const targetRatio = getQrDarkRatio(sourceQr);
+  const desired = Math.round(targetRatio * area);
+  // Bisection compensates for the darker silhouette outline and removes
+  // disconnected pixels without producing a patchy, lower-density shape.
+  let low = 0, high = 1;
+  let best = connected(0.5);
+  for (let i = 0; i < 10; i++) {
+    const threshold = (low + high) / 2;
+    const trial = connected(threshold);
+    if (Math.abs(trial.count - desired) < Math.abs(best.count - desired)) best = trial;
+    if (trial.count < desired) low = threshold; else high = threshold;
+  }
+  return {
+    cols,
+    dark: best.dark,
+    targetRatio,
+    actualRatio: area ? best.count / area : 0
+  };
 }
 function eachDecoration(layout, opts, value, callback, qr = null) {
-  const pattern = decorationMatrix(layout, opts, value);
+  const pattern = decorationMatrix(layout, opts, value, qr);
   const unit = layout.cellSize;
   for (let r = 0; r < pattern.cols; r++) for (let c = 0; c < pattern.cols; c++) {
     if (pattern.dark[r * pattern.cols + c]) callback(c * unit, r * unit, unit);
