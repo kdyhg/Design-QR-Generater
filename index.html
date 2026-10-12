@@ -224,29 +224,6 @@
             margin-top: 14px;
         }
 
-        .footer-credit {
-            margin-top: 24px;
-            padding-top: 18px;
-            border-top: 1px solid var(--line);
-            color: var(--text-sub);
-            font-size: 14px;
-            text-align: center;
-        }
-
-        .footer-credit strong {
-            color: var(--text-main);
-        }
-
-        .footer-credit a {
-            color: var(--primary);
-            font-weight: 700;
-            text-decoration: none;
-        }
-
-        .footer-credit a:hover {
-            text-decoration: underline;
-        }
-
         #status-msg {
             position: fixed;
             bottom: 26px;
@@ -407,6 +384,13 @@
                     </select>
                 </div>
                 <div class="control">
+                    <label for="edgeStyle">장식 연결 방식</label>
+                    <select id="edgeStyle">
+                        <option value="adaptive">자연스럽게 연결 (자동 검증)</option>
+                        <option value="standard">표준 여백 유지 (4칸)</option>
+                    </select>
+                </div>
+                <div class="control">
                     <label for="paletteSelect">색상 프리셋</label>
                     <select id="paletteSelect">
                         <option value="custom">직접 선택</option>
@@ -428,6 +412,7 @@
                     <label for="gradientColor">그라데이션 끝 색상</label>
                     <input type="color" id="gradientColor" value="#d9365e">
                 </div>
+                <p class="field-note full-control">연결형 장식은 자동 스캔 검증 결과에 따라 여백을 조절합니다. 인쇄물은 실제 스마트폰으로 확인해주세요.</p>
                 <div class="control full-control">
                     <label for="logoInput">중앙 로고·이미지 (선택)</label>
                     <input type="file" id="logoInput" accept="image/png,image/jpeg,image/webp,image/gif">
@@ -478,10 +463,6 @@
         </div>
     </details>
 
-    <div class="footer-credit">
-        제작: <strong>동티</strong> |
-        <a href="https://blog.naver.com/math_dt" target="_blank" rel="noopener noreferrer">블로그 방문하기</a>
-    </div>
 </main>
 <div id="status-msg" role="status" aria-live="polite"></div>
 </body>
