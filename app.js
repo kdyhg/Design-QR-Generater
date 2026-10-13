@@ -302,95 +302,100 @@ function decorationMatrix(layout, opts, value, qr = null) {
   const mask = new Uint8Array(length);
   const outline = new Uint8Array(length);
   const scores = new Float32Array(length);
+  const dark = new Uint8Array(length);
   const first = layout.qrX / layout.cellSize;
   const last = first + layout.count;
-  const at = (row, col) => row * cols + col;
-  const inBounds = (row, col) => row >= 0 && col >= 0 && row < cols && col < cols;
-  const inQR = (row, col) => row >= first && row < last && col >= first && col < last;
+  const at = (r, c) => r * cols + c;
+  const inBounds = (r, c) => r >= 0 && c >= 0 && r < cols && c < cols;
+  const inQR = (r, c) => r >= first && r < last && c >= first && c < last;
   const neighbors = [[-1, 0], [1, 0], [0, -1], [0, 1]];
   const seed = value + "|" + opts.shape + "|" + (opts.seedOffset || 0);
   let area = 0;
-  for (let row = 0; row < cols; row++) for (let col = 0; col < cols; col++) {
-    if (inQR(row, col)) continue;
-    if (!insideShape(opts.shape, (col + 0.5) * layout.cellSize,
-      (row + 0.5) * layout.cellSize, layout.canvasSize)) continue;
-    const i = at(row, col);
+  for (let r = 0; r < cols; r++) for (let c = 0; c < cols; c++) {
+    if (inQR(r, c)) continue;
+    if (!insideShape(opts.shape, (c + 0.5) * layout.cellSize,
+      (r + 0.5) * layout.cellSize, layout.canvasSize)) continue;
+    const i = at(r, c);
     mask[i] = 1;
     area++;
-    // A modest 2x2 texture component creates QR-like clumps, not isolated specks.
-    const fine = seededUnit("fine|" + seed + "|" + row + "|" + col);
-    const block = seededUnit("tile|" + seed + "|" +
-      Math.floor(row / 2) + "|" + Math.floor(col / 2));
+    const fine = seededUnit("fine|" + seed + "|" + r + "|" + c);
+    const block = seededUnit("tile|" + seed + "|" + Math.floor(r / 2) +
+      "|" + Math.floor(c / 2));
     scores[i] = 0.78 * fine + 0.22 * block;
   }
-  for (let row = 0; row < cols; row++) for (let col = 0; col < cols; col++) {
-    const i = at(row, col);
+  for (let r = 0; r < cols; r++) for (let c = 0; c < cols; c++) {
+    const i = at(r, c);
     if (!mask[i]) continue;
-    // Preserve the recognisable solid silhouette, including sharp star tips.
+    // A contiguous silhouette edge keeps the heart, cloud and sharp star crisp.
     outline[i] = neighbors.some(([dy, dx]) => {
-      const y = row + dy, x = col + dx;
+      const y = r + dy, x = c + dx;
       return !inBounds(y, x) || (!mask[at(y, x)] && !inQR(y, x));
     }) ? 1 : 0;
   }
 
-  function connected(threshold) {
-    const candidate = new Uint8Array(length);
-    const kept = new Uint8Array(length);
-    const queue = [];
-    for (let row = 0; row < cols; row++) for (let col = 0; col < cols; col++) {
-      const i = at(row, col);
-      if (!mask[i] || (!outline[i] && scores[i] >= threshold)) continue;
-      candidate[i] = 1;
-      if (neighbors.some(([dy, dx]) => inQR(row + dy, col + dx))) {
-        kept[i] = 1;
-        queue.push(i);
+  const targetRatio = getQrDarkRatio(sourceQr);
+  // A global threshold plus flood-fill can delete whole patches of valid
+  // ornament pixels. Instead, ensure that every 4x4 module tile has its own
+  // fair share of QR-like dark cells. Nothing inside a valid shape is discarded
+  // merely because it is not connected to the QR boundary.
+  const tileSize = 4;
+  const tiles = [];
+  let count = 0;
+  for (let top = 0; top < cols; top += tileSize) {
+    for (let left = 0; left < cols; left += tileSize) {
+      const candidates = [];
+      let forced = 0;
+      for (let r = top; r < Math.min(top + tileSize, cols); r++) {
+        for (let c = left; c < Math.min(left + tileSize, cols); c++) {
+          const i = at(r, c);
+          if (!mask[i]) continue;
+          if (outline[i]) { dark[i] = 1; forced++; }
+          else candidates.push(i);
+        }
       }
-    }
-    if (!queue.length) {
-      const firstDark = candidate.indexOf(1);
-      if (firstDark !== -1) { kept[firstDark] = 1; queue.push(firstDark); }
-    }
-    for (let k = 0; k < queue.length; k++) {
-      const i = queue[k], row = Math.floor(i / cols), col = i % cols;
-      for (const [dy, dx] of neighbors) {
-        const y = row + dy, x = col + dx;
-        if (!inBounds(y, x)) continue;
-        const next = at(y, x);
-        if (candidate[next] && !kept[next]) { kept[next] = 1; queue.push(next); }
+      const eligible = forced + candidates.length;
+      if (!eligible) continue;
+      // Independently balance each small tile against the QR's true density,
+      // accounting for the outline cells already required by the silhouette.
+      const wanted = Math.max(forced, Math.round(eligible * targetRatio));
+      candidates.sort((a, b) => scores[b] - scores[a] || a - b);
+      for (let j = 0; j < wanted - forced && j < candidates.length; j++) {
+        dark[candidates[j]] = 1;
       }
+      tiles.push({ candidates, forced, eligible, selected: wanted });
+      count += wanted;
     }
-    // Retain pixels at acute tips if they touch a kept region diagonally.
-    for (let pass = 0; pass < 2; pass++) {
-      for (let row = 0; row < cols; row++) for (let col = 0; col < cols; col++) {
-        const i = at(row, col);
-        if (!candidate[i] || kept[i]) continue;
-        if ([[-1,-1],[-1,1],[1,-1],[1,1]].some(([dy,dx]) =>
-          inBounds(row + dy,col + dx) && kept[at(row + dy,col + dx)])) kept[i] = 1;
-      }
-    }
-    let count = 0;
-    for (const bit of kept) count += bit;
-    return {dark: kept, count};
   }
 
-  const targetRatio = getQrDarkRatio(sourceQr);
-  const desired = Math.round(targetRatio * area);
-  // Bisection compensates for the darker silhouette outline and removes
-  // disconnected pixels without producing a patchy, lower-density shape.
-  let low = 0, high = 1;
-  let best = connected(0.5);
-  for (let i = 0; i < 10; i++) {
-    const threshold = (low + high) / 2;
-    const trial = connected(threshold);
-    if (Math.abs(trial.count - desired) < Math.abs(best.count - desired)) best = trial;
-    if (trial.count < desired) low = threshold; else high = threshold;
+  // Correct the small per-tile rounding bias without recreating large empty
+  // patches. This is especially important on the flower's narrow petals,
+  // where outline pixels comprise a substantial portion of the mask.
+  const desiredTotal = Math.round(area * targetRatio);
+  while (count !== desiredTotal) {
+    let choice = null, bestPriority = -Infinity;
+    for (const tile of tiles) {
+      const { candidates, forced, eligible, selected } = tile;
+      if (count > desiredTotal) {
+        const minimum = Math.max(forced, Math.floor(eligible * Math.max(0.28, targetRatio - 0.13)));
+        if (selected <= minimum || selected <= forced) continue;
+        const priority = selected / eligible - targetRatio +
+          (1 - scores[candidates[selected - forced - 1]]) * 0.02;
+        if (priority > bestPriority) { choice = tile; bestPriority = priority; }
+      } else {
+        if (selected >= eligible) continue;
+        const priority = targetRatio - selected / eligible +
+          scores[candidates[selected - forced]] * 0.02;
+        if (priority > bestPriority) { choice = tile; bestPriority = priority; }
+      }
+    }
+    if (!choice) break;
+    const pos = count > desiredTotal ?
+      choice.selected - choice.forced - 1 : choice.selected - choice.forced;
+    dark[choice.candidates[pos]] = count > desiredTotal ? 0 : 1;
+    choice.selected += count > desiredTotal ? -1 : 1;
+    count += count > desiredTotal ? -1 : 1;
   }
-  return {
-    cols,
-    dark: best.dark,
-    targetRatio,
-    actualRatio: area ? best.count / area : 0
-  };
+  return { cols, dark, targetRatio, actualRatio: area ? count / area : 0 };
 }
 function eachDecoration(layout, opts, value, callback, qr = null) {
   const pattern = decorationMatrix(layout, opts, value, qr);

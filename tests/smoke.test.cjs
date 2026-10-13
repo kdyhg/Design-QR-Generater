@@ -117,6 +117,49 @@ test("outer ornament dark density tracks actual QR dark density across all shape
   }
 });
 
+test("no empty interior pockets in any 4x4 ornament window", () => {
+  const values = ["https://www.google.com/", "https://example.com/",
+    "학교 수학 동아리", "WIFI:T:WPA;S:Test;P:password123;;"];
+  let checked = 0;
+  for (const value of values) {
+    const qr = api.createQr(value);
+    for (const shape of ["heart", "star", "circle", "flower", "cloud", "bubble"]) {
+      const layout = api.buildLayout(qr, shape), opts = { shape, seedOffset: 0 };
+      const art = api.decorationMatrix(layout, opts, value, qr);
+      assert.ok(Math.abs(art.actualRatio - art.targetRatio) < 0.015,
+        shape + " must retain the QR's overall module density");
+      const n = art.cols, step = layout.cellSize, span = 4;
+      for (let top = 0; top + span <= n; top++) {
+        for (let left = 0; left + span <= n; left++) {
+          let allInside = true, dark = 0;
+          for (let dy = 0; dy < span; dy++) {
+            for (let dx = 0; dx < span; dx++) {
+              const row = top + dy, col = left + dx, x = col * step, y = row * step;
+              const qrCell = x >= layout.qrX && x < layout.qrX + layout.qrSize &&
+                y >= layout.qrY && y < layout.qrY + layout.qrSize;
+              if (qrCell || !api.insideShape(shape, x + step / 2, y + step / 2,
+                layout.canvasSize)) {
+                allInside = false;
+                break;
+              }
+              dark += art.dark[row * n + col];
+            }
+            if (!allInside) break;
+          }
+          if (allInside) {
+            checked++;
+            assert.ok(dark > 0, shape + " has a blank 4x4 pocket");
+          }
+        }
+      }
+      assert.deepEqual(Array.from(art.dark),
+        Array.from(api.decorationMatrix(layout, opts, value, qr).dark),
+        "matching pattern should remain deterministic");
+    }
+  }
+  assert.ok(checked > 500, "inspect many moving windows");
+});
+
 test("five-point star has straight sharp tips, not rounded cosine lobes", () => {
   assert.equal(api.SHARP_STAR_POINTS.length,10);
   assert.ok(api.SHARP_STAR_POINTS.every((p)=>p.length===2));
